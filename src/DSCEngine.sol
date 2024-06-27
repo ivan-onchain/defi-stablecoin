@@ -7,6 +7,7 @@ import {DecentralizedStableCoin} from "./DecentralizedStableCoin.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { AggregatorV3Interface } from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {OracleLib} from "./lib/OracleLib.sol";
 
 contract DSCEngine is ReentrancyGuard {
     /////////////////
@@ -20,6 +21,12 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__MintFailed();
     error DSCEngine__HealthFactorOk();
     error DSCEngine__HealthFactorNotImproved();
+
+    /////////////////
+    /// Types  /// 
+    ///////////////// 
+
+    using OracleLib for AggregatorV3Interface;
 
     /////////////////
     /// State variables /// 
@@ -39,8 +46,6 @@ contract DSCEngine is ReentrancyGuard {
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 amountDscMinted) private s_DSCMinted;
     address[] private s_collateralTokens;
-
-    
      /////////////////
     /// Events /// 
     ///////////////// 
@@ -160,11 +165,17 @@ contract DSCEngine is ReentrancyGuard {
         nonReentrant
     {
         uint256 startingUserHealthFactor = _healthFactor(user);
+        
         if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
             revert DSCEngine__HealthFactorOk();
         }
         // If covering 100 DSC, we need to $100 of collateral
+        console.log('debtToCover: ', debtToCover);
+        
         uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateral, debtToCover);
+        console.log('tokenAmountFromDebtCovered: ', tokenAmountFromDebtCovered);
+        // 1000000000000000000
+        // 100000000000000000
         // And give them a 10% bonus
         // So we are giving the liquidator $110 of WETH for 100 DSC
         // We should implement a feature to liquidate in the event the protocol is insolvent
@@ -174,13 +185,13 @@ contract DSCEngine is ReentrancyGuard {
         // Figure out how much collateral to recover based on how much burnt
         _redeemCollateral(collateral, tokenAmountFromDebtCovered + bonusCollateral, user, msg.sender);
         _burnDsc(debtToCover, user, msg.sender);
-
+        
         uint256 endingUserHealthFactor = _healthFactor(user);
         // This conditional should never hit, but just in case
         if (endingUserHealthFactor <= startingUserHealthFactor) {
             revert DSCEngine__HealthFactorNotImproved();
         }
-        _revertIfHealthFactorIsBroken(msg.sender);
+        _revertIfHealthFactorIsBroken(user);
     }
 
         //////////////////////////////
@@ -198,6 +209,9 @@ contract DSCEngine is ReentrancyGuard {
 
     function _healthFactor(address user) private view returns (uint256) {
         (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
+        console.log('totalDscMinted: ', totalDscMinted);
+        console.log('collateralValueInUsd: ', collateralValueInUsd/1e18);
+        
         return _calculateHealthFactor(totalDscMinted, collateralValueInUsd);
     }
 
@@ -206,10 +220,11 @@ contract DSCEngine is ReentrancyGuard {
         uint256 collateralValueInUsd
     )
         internal
-        pure
+        view
         returns (uint256)
     {
-        if (totalDscMinted == 0) return type(uint256).max;
+        if (totalDscMinted == 0 && collateralValueInUsd > 0) return type(uint256).max;
+        if (collateralValueInUsd == 0) return type(uint256).min;
         //Example: $2000 ETH(CollateralValueInUsd) | $1000 DSC
         // collateralAdjustedForThreshold = 2000 * (50(threshold) / 100 (liquidacion precision)) = 2000 * (1/2) = 1000
         // HealthFactor = collateralAdjustedForThreshold * 1e18 / 2000(dsc) = 1000/1000 * 1e18 = 1 * 1e18
@@ -217,8 +232,10 @@ contract DSCEngine is ReentrancyGuard {
         // Example of bad heathFactor: $1999 ETH | $1000 DSC.
         // collateralAdjustedForThreshold = 1999 * (50(threshold) / 100 (liquidacion precision)) = 1999 * (1/2) = 999.5
         // HealthFactor = collateralAdjustedForThreshold * 1e18 / 1000 = 999/1000 * 1e18 = 0.999 * 1e18 < 1e18.
+        
         uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
         return (collateralAdjustedForThreshold * PRECISION) / totalDscMinted;
+        // return (collateralAdjustedForThreshold) / totalDscMinted;
     }
 
     function _revertIfHealthFactorIsBroken(address user) internal view {
@@ -236,7 +253,7 @@ contract DSCEngine is ReentrancyGuard {
         address to
     )
         private
-    {
+    {   
         s_collateralDeposited[from][tokenCollateralAddress] -= amountCollateral;
         emit CollateralRedeemed(from, to, tokenCollateralAddress, amountCollateral);
         bool success = IERC20(tokenCollateralAddress).transfer(to, amountCollateral);
@@ -280,7 +297,7 @@ contract DSCEngine is ReentrancyGuard {
 
     function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
         // $100e18 USD Debt
         // 1 ETH = 2000 USD
         // The returned value from Chainlink will be 2000 * 1e8
@@ -290,12 +307,58 @@ contract DSCEngine is ReentrancyGuard {
 
     function getUsdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
+        
         // 1 ETH = 1000 USD
         // The returned value from Chainlink will be 1000 * 1e8. It is got it from Chainlink data-feed/prices
         // Most USD pairs have 8 decimals, so we will just pretend they all do
         // We want to have everything in terms of WEI, so we add 10 zeros at the end
-        console.log('price: ', uint256(price));
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
+    }
+
+    function calculateHealthFactor( uint256 totalDscMinted,
+        uint256 collateralValueInUsd) public view
+        returns (uint256){
+            return _calculateHealthFactor(totalDscMinted,  collateralValueInUsd);
+    }
+
+    function getCollateralTokens() public view returns (address[] memory){
+        return s_collateralTokens;
+    }
+
+    function getCollateralTokenPriceFeed(address collateralToken) public view returns (address priceFeed){
+        return s_priceFeeds[collateralToken];
+    }
+
+    function getCollateralBalanceOfUser(address collateralToken, address user) public view returns (uint256) {
+        return s_collateralDeposited[user][collateralToken];
+    }
+
+    function getMinHealthFactor() public pure returns (uint256){
+        return MIN_HEALTH_FACTOR;
+    }
+
+    function getHealthFactor(address user) external view returns (uint256) {
+     return _healthFactor(user);
+    }
+
+    function getAdditionalFeedPrecision() external pure returns (uint256) {
+        return ADDITIONAL_FEED_PRECISION;
+    }
+
+    function getLiquidationBonus() external pure returns (uint256) {
+        return LIQUIDATION_BONUS;
+    }
+
+    function getLiquidationThreshold() external pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getPrecision() external pure returns (uint256) {
+        return PRECISION;
+    }
+
+    function getDsc() external view returns (address) {
+        return address(i_dsc);
     }
 }
